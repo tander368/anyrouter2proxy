@@ -18,6 +18,81 @@ import { CookieJar } from 'tough-cookie';
 
 const PORT = process.env.NODE_PROXY_PORT || 4000;
 const ANTHROPIC_BASE_URL = process.env.ANYROUTER_BASE_URL || 'https://anyrouter.top';
+const DEFAULT_SUPPORTED_MODELS = [
+  'claude-haiku-4-5-20251001',
+  'claude-3-5-haiku-20241022',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-7-sonnet-20250219',
+  'claude-sonnet-4-20250514',
+  'claude-sonnet-4-5-20250929',
+  'claude-sonnet-4-6',
+  'claude-opus-4-5-20251101',
+  'claude-opus-4-6',
+];
+const DEFAULT_MODEL_ALIASES = new Map([
+  ['claude-opus-4-6[1m]', 'claude-opus-4-6'],
+]);
+const SENSITIVE_HEADER_NAMES = new Set(['authorization', 'x-api-key', 'cookie', 'set-cookie']);
+
+function parseCsvEnv(raw, fallback) {
+  if (!raw) return [...fallback];
+  return raw.split(',').map(item => item.trim()).filter(Boolean);
+}
+
+function parseModelAliases(raw) {
+  const aliases = new Map();
+  if (!raw) return aliases;
+
+  for (const pair of raw.split(',')) {
+    const [alias, target] = pair.split('=').map(item => item?.trim());
+    if (alias && target) {
+      aliases.set(alias, target);
+    }
+  }
+
+  return aliases;
+}
+
+const SUPPORTED_MODELS = parseCsvEnv(process.env.SUPPORTED_MODELS, DEFAULT_SUPPORTED_MODELS);
+const MODEL_ALIASES = new Map([
+  ...DEFAULT_MODEL_ALIASES.entries(),
+  ...parseModelAliases(process.env.MODEL_ALIASES).entries(),
+]);
+
+function normalizeModel(model) {
+  if (!model) return model;
+  return MODEL_ALIASES.get(model) || model;
+}
+
+function buildModelsPayload() {
+  const seen = new Set();
+  const data = [];
+
+  for (const model of [...SUPPORTED_MODELS, ...MODEL_ALIASES.keys()]) {
+    if (seen.has(model)) continue;
+    seen.add(model);
+    data.push({
+      id: model,
+      object: 'model',
+      created: 0,
+      owned_by: 'anthropic',
+    });
+  }
+
+  return {
+    object: 'list',
+    data,
+  };
+}
+
+function redactHeadersForLog(headers = {}) {
+  return Object.fromEntries(
+    Object.entries(headers).map(([key, val]) => [
+      key,
+      SENSITIVE_HEADER_NAMES.has(key.toLowerCase()) ? '<redacted>' : val,
+    ])
+  );
+}
 
 /**
  * 生成随机十六进制字符串
@@ -145,7 +220,7 @@ async function makeRawRequest(url, options, body) {
     }
 
     console.log('Making request to:', url);
-    console.log('Request headers:', JSON.stringify(reqOptions.headers, null, 2));
+    console.log('Request headers:', JSON.stringify(redactHeadersForLog(reqOptions.headers), null, 2));
 
     const req = https.request(reqOptions, (res) => {
       const chunks = [];
@@ -325,7 +400,12 @@ function supportsThinking(model) {
 async function callAnthropicApi(apiKey, body, isStream, clientHeaders = {}) {
   const url = `${ANTHROPIC_BASE_URL}/v1/messages`;
 
-  const model = body.model || '';
+  const requestedModel = body.model || '';
+  const model = normalizeModel(requestedModel);
+  if (model && requestedModel !== model) {
+    body.model = model;
+    console.log(`Model alias resolved: ${requestedModel} -> ${model}`);
+  }
 
   // 根据模型能力注入 thinking 字段（Claude Code 对所有支持 thinking 的模型统一用 adaptive）
   if (!body.thinking) {
@@ -488,6 +568,27 @@ async function handleMessages(req, res, body) {
       return;
     }
 
+    if (!response.ok) {
+      const contentType = response.headers['content-type'] || 'application/json';
+
+      if (contentType.includes('application/json')) {
+        res.writeHead(response.status, { 'Content-Type': 'application/json' });
+        res.end(response.text);
+      } else {
+        console.error('Unexpected upstream error content type:', contentType);
+        console.error('Response preview:', response.text.substring(0, 500));
+        res.writeHead(response.status >= 400 ? response.status : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'upstream_error',
+            message: 'Unexpected response from upstream',
+          }
+        }));
+      }
+      return;
+    }
+
     if (isStream) {
       // 流式响应
       res.writeHead(200, {
@@ -564,6 +665,11 @@ function handleHealth(req, res) {
   }));
 }
 
+function handleModels(req, res) {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(buildModelsPayload()));
+}
+
 /**
  * 主服务器
  */
@@ -585,6 +691,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/v1/messages' && req.method === 'POST') {
       const body = await parseBody(req);
       await handleMessages(req, res, body);
+    } else if (url.pathname === '/v1/models' && req.method === 'GET') {
+      handleModels(req, res);
     } else if (url.pathname === '/health' && req.method === 'GET') {
       handleHealth(req, res);
     } else if (url.pathname === '/' && req.method === 'GET') {
@@ -619,7 +727,8 @@ server.listen(PORT, () => {
 ║  功能: 自动处理 ACW WAF JavaScript 挑战                   ║
 ╠══════════════════════════════════════════════════════════╣
 ║  端点:                                                    ║
-║    POST /v1/messages - Anthropic Messages API            ║
+║    POST /v1/messages - Anthropic Messages API            
+║    GET  /v1/models   - 静态模型清单                       ║
 ║    GET  /health      - 健康检查                           ║
 ╚══════════════════════════════════════════════════════════╝
 `);
